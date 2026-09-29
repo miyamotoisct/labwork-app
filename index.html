@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>業務共有</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a href="#/" class="brand">業務共有</a>
+    <div class="topbar-right">
+      <span id="conn-badge" class="badge">未接続</span>
+      <button id="btn-refresh" class="btn ghost" title="最新の状態を読み込む">↻ 更新</button>
+      <a href="#/settings" class="btn ghost">⚙ 設定</a>
+    </div>
+  </header>
+  <main id="app"></main>
+  <div id="toast"></div>
+
+  <script src="config.js"></script>
+  <script src="js/templates.js"></script>
+  <script src="js/storage.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
