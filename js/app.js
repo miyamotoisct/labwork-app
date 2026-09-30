@@ -17,10 +17,23 @@ function loadConn() {
     if (c && typeof c === 'object') return c;
   } catch (_) {}
   const d = window.APP_CONFIG || {};
-  return { mode: 'github', owner: d.owner || '', repo: d.repo || '', branch: d.branch || 'main', token: '' };
+  return { mode: d.mode || 'gas', gasUrl: d.gasUrl || '', password: '', owner: d.owner || '', repo: d.repo || '', branch: d.branch || 'main', token: '' };
 }
 function saveConn(c) { localStorage.setItem(CONN_KEY, JSON.stringify(c)); }
-function connReady(c) { return c.mode === 'local' || !!(c.owner && c.repo && c.token); }
+function connReady(c) {
+  if (c.mode === 'local') return true;
+  if (c.mode === 'github') return !!(c.owner && c.repo && c.token);
+  return !!(c.gasUrl && c.password);
+}
+function makeStore(c) {
+  if (c.mode === 'local') return new Store(new LocalBackend());
+  if (c.mode === 'github') return new Store(new GitHubBackend(c));
+  return new GasStore(c);
+}
+function connMissingMessage(c) {
+  if (c.mode === 'github') return 'オーナー・リポジトリ名・トークンをすべて入力してください';
+  return 'Web アプリの URL とパスワードを入力してください';
+}
 
 let toastTimer;
 function toast(msg, kind = 'info') {
@@ -77,8 +90,7 @@ async function connect() {
   state.store = null; state.settings = null; state.index = null; state.draft = null;
   updateConnBadge();
   if (!connReady(state.conn)) return false;
-  const backend = state.conn.mode === 'local' ? new LocalBackend() : new GitHubBackend(state.conn);
-  const store = new Store(backend);
+  const store = makeStore(state.conn);
   try {
     const [settings, index] = await Promise.all([store.loadSettings(), store.loadIndex()]);
     state.store = store; state.settings = settings; state.index = index;
@@ -140,7 +152,7 @@ function renderConnectPrompt() {
   $('#app').innerHTML = `
     <section class="panel center">
       <h2>ようこそ</h2>
-      <p class="help">はじめに「設定」でデータの保存先（GitHub リポジトリ）とアクセストークンを登録してください。</p>
+      <p class="help">はじめに「設定」でデータの保存先（Web アプリの URL とパスワード）を登録してください。</p>
       <a href="#/settings" class="btn primary">設定を開く</a>
     </section>`;
 }
@@ -395,9 +407,10 @@ function summaryOf(p) {
 }
 
 async function persistProject(p) {
-  await state.store.saveProject(p);
+  const summary = summaryOf(p);
+  await state.store.saveProject(p, summary);
   state.index = await state.store.updateIndex(idx => {
-    const s = summaryOf(p);
+    const s = summary;
     const i = idx.projects.findIndex(x => x.id === p.id);
     if (i >= 0) idx.projects[i] = s; else idx.projects.push(s);
   });
@@ -475,7 +488,7 @@ function onChange(e) {
   const t = e.target;
   if (state.view === 'list' && t.id === 'filter') { state.filter = t.value; renderCards(); return; }
   if (state.view === 'settings') {
-    if (t.name === 'mode') { const gh = $('#gh-fields'); if (gh) gh.style.display = t.value === 'local' ? 'none' : ''; return; }
+    if (t.name === 'mode') { showModeFields(t.value); return; }
     if (IMMEDIATE_TYPES.has(t.type)) settingsFieldChange(t);
     return;
   }
@@ -631,7 +644,8 @@ async function projectClick(e) {
 /* ===== ファイル ===== */
 async function uploadFiles(it, files) {
   for (const f of files) {
-    if (f.size > MAX_FILE_SIZE) { toast(`${f.name} は大きすぎます（上限 ${fmtSize(MAX_FILE_SIZE)}）`, 'error'); continue; }
+    const limit = state.store.maxFileSize || MAX_FILE_SIZE;
+    if (f.size > limit) { toast(`${f.name} は大きすぎます（上限 ${fmtSize(limit)}）`, 'error'); continue; }
     setStatus(`アップロード中: ${f.name}`);
     try {
       const meta = await state.store.uploadFile(state.project.id, f);
@@ -680,6 +694,7 @@ async function deleteFile(it, fid) {
 function renderSettings() {
   state.view = 'settings';
   const c = state.connDraft || state.conn;
+  const mode = ['gas', 'github', 'local'].includes(c.mode) ? c.mode : 'gas';
   const connected = !!state.store;
   if (!state.draft && state.settings) state.draft = clone(state.settings);
 
@@ -688,17 +703,22 @@ function renderSettings() {
     <h2>設定</h2>
     <section class="panel">
       <h3>データの保存先</h3>
-      <p class="help">データは GitHub のリポジトリに保存されます。アプリ本体とは<b>別のプライベートリポジトリ</b>を用意すると、アプリを更新してもデータは失われません。共有相手にも同じリポジトリへの書き込み権限とトークンが必要です。</p>
+      <p class="help">アプリ本体とは別の場所にデータを保存するため、アプリを更新しても入力した情報は失われません。設定はこのブラウザの中にだけ保存され、共有相手も同じ設定を自分のブラウザで一度入力します。</p>
       <form id="conn-form">
-        <label class="radio"><input type="radio" name="mode" value="github" ${c.mode !== 'local' ? 'checked' : ''}> GitHub リポジトリに保存（共有用）</label>
-        <label class="radio"><input type="radio" name="mode" value="local" ${c.mode === 'local' ? 'checked' : ''}> このブラウザの中だけに保存（お試し用。共有されません）</label>
-        <div class="grid" id="gh-fields" style="${c.mode === 'local' ? 'display:none' : ''}">
-          <label>オーナー（GitHub のユーザー名 / 組織名）<input name="owner" value="${esc(c.owner)}" autocomplete="off"></label>
-          <label>データ用リポジトリ名<input name="repo" value="${esc(c.repo)}" autocomplete="off"></label>
-          <label>ブランチ<input name="branch" value="${esc(c.branch || 'main')}" autocomplete="off"></label>
-          <label>アクセストークン（Fine-grained personal access token）<input name="token" type="password" value="${esc(c.token)}" autocomplete="off"></label>
+        <label class="radio"><input type="radio" name="mode" value="gas" ${mode === 'gas' ? 'checked' : ''}> Google Drive に保存（Apps Script 経由・推奨。共通パスワードだけで利用できます）</label>
+        <label class="radio"><input type="radio" name="mode" value="github" ${mode === 'github' ? 'checked' : ''}> GitHub リポジトリに保存（上級者向け。利用者ごとにアクセストークンが必要です）</label>
+        <label class="radio"><input type="radio" name="mode" value="local" ${mode === 'local' ? 'checked' : ''}> このブラウザの中だけに保存（お試し用。共有されません）</label>
+        <div class="grid mode-fields" data-mode="gas" style="${mode === 'gas' ? '' : 'display:none'}">
+          <label>Web アプリの URL（https://script.google.com/macros/s/…/exec）<input name="gasUrl" value="${esc(c.gasUrl || '')}" autocomplete="off"></label>
+          <label>パスワード（Apps Script に設定した共通パスワード）<input name="password" type="password" value="${esc(c.password || '')}" autocomplete="off"></label>
         </div>
-        <p class="help small">トークンはこのブラウザの中にだけ保存され、GitHub 以外には送信されません。トークンの作り方は README.md を参照してください。</p>
+        <div class="grid mode-fields" data-mode="github" style="${mode === 'github' ? '' : 'display:none'}">
+          <label>オーナー（GitHub のユーザー名 / 組織名）<input name="owner" value="${esc(c.owner || '')}" autocomplete="off"></label>
+          <label>データ用リポジトリ名<input name="repo" value="${esc(c.repo || '')}" autocomplete="off"></label>
+          <label>ブランチ<input name="branch" value="${esc(c.branch || 'main')}" autocomplete="off"></label>
+          <label>アクセストークン（Fine-grained personal access token）<input name="token" type="password" value="${esc(c.token || '')}" autocomplete="off"></label>
+        </div>
+        <p class="help small">セットアップの手順は README.md を参照してください。</p>
         <div class="actions">
           <button type="button" id="btn-test" class="btn">接続テスト</button>
           <button class="btn primary">保存して接続</button>
@@ -764,12 +784,18 @@ function templateHTML(c, secs) {
     </details>`;
 }
 
+function showModeFields(mode) {
+  document.querySelectorAll('.mode-fields').forEach(el => { el.style.display = el.dataset.mode === mode ? '' : 'none'; });
+}
+
 function readConnForm() {
   const form = $('#conn-form');
   if (!form) return null;
   const mode = form.querySelector('input[name="mode"]:checked');
   return {
-    mode: mode ? mode.value : 'github',
+    mode: mode ? mode.value : 'gas',
+    gasUrl: form.gasUrl.value.trim(),
+    password: form.password.value,
     owner: form.owner.value.trim(),
     repo: form.repo.value.trim(),
     branch: form.branch.value.trim() || 'main',
@@ -805,10 +831,9 @@ async function settingsClick(e) {
     const out = $('#conn-result');
     out.textContent = '確認中…'; out.className = 'help';
     try {
-      const backend = c.mode === 'local' ? new LocalBackend() : new GitHubBackend(c);
-      if (c.mode !== 'local' && !(c.owner && c.repo && c.token)) throw new Error('オーナー・リポジトリ名・トークンをすべて入力してください');
-      await backend.testConnection();
-      out.textContent = '✓ 接続できます（書き込み権限あり）'; out.className = 'help ok';
+      if (!connReady(c)) throw new Error(connMissingMessage(c));
+      await makeStore(c).testConnection();
+      out.textContent = '✓ 接続できます'; out.className = 'help ok';
     } catch (err) {
       out.textContent = '✗ ' + err.message; out.className = 'help error';
     }
@@ -879,8 +904,8 @@ function rerenderSettings() {
 
 async function saveConnection(form) {
   const c = readConnForm();
-  if (c.mode !== 'local' && !(c.owner && c.repo && c.token)) {
-    toast('オーナー・リポジトリ名・トークンをすべて入力してください', 'error');
+  if (!connReady(c)) {
+    toast(connMissingMessage(c), 'error');
     return;
   }
   state.conn = c;

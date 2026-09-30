@@ -196,6 +196,7 @@ const PATHS = {
 class Store {
   constructor(backend) { this.b = backend; }
   get label() { return this.b.label; }
+  get maxFileSize() { return 50 * 1024 * 1024; }
   testConnection() { return this.b.testConnection(); }
 
   async loadSettings() { return normalizeSettings(await this.b.getJSON(PATHS.settings)); }
@@ -252,4 +253,80 @@ function allFilesOf(project) {
     }
   }
   return out;
+}
+
+/* ===== Google Apps Script（Google Drive 保存）ストア =====
+   gas/Code.gs を Web アプリとして公開し、その URL と共通パスワードで接続する。
+   ファイル単位の sha 管理は不要で、競合検出はサーバー側の updatedAt 比較で行う。 */
+class GasStore {
+  constructor({ gasUrl, password }) {
+    this.url = (gasUrl || '').trim();
+    this.password = password || '';
+    this.bases = new Map();   // projectId -> 最後に読み込んだ/保存した updatedAt
+    this.lastIndex = null;    // 保存・削除の応答に含まれる最新一覧
+    this.allPromise = null;   // getAll の同時呼び出しをまとめる
+  }
+  get label() { return 'Google Drive（Apps Script）'; }
+  get maxFileSize() { return 20 * 1024 * 1024; }
+
+  async call(action, params) {
+    let r;
+    try {
+      // Content-Type を指定しない（text/plain のまま）ことで CORS の事前確認なしに送れる
+      r = await fetch(this.url, { method: 'POST', body: JSON.stringify(Object.assign({ action, password: this.password }, params || {})) });
+    } catch (e) {
+      throw new StorageError('サーバーに接続できません: ' + e.message);
+    }
+    const text = await r.text();
+    let j;
+    try { j = JSON.parse(text); } catch (_) {
+      throw new StorageError('サーバーから想定外の応答がありました。Web アプリの URL と公開設定（アクセスできるユーザー: 全員）を確認してください');
+    }
+    if (!j.ok) throw new StorageError(j.error || 'サーバーでエラーが発生しました');
+    return j.result;
+  }
+  getAll() {
+    if (!this.allPromise) {
+      this.allPromise = this.call('getAll').finally(() => { this.allPromise = null; });
+    }
+    return this.allPromise;
+  }
+
+  async testConnection() { await this.call('ping'); }
+  async loadSettings() { return normalizeSettings((await this.getAll()).settings); }
+  async saveSettings(s) { await this.call('saveSettings', { settings: s }); }
+  async loadIndex() { return { projects: (await this.getAll()).index || [] }; }
+  async updateIndex() {
+    if (this.lastIndex) { const i = this.lastIndex; this.lastIndex = null; return i; }
+    return this.loadIndex();
+  }
+  async loadProject(id) {
+    const r = await this.call('getProject', { id });
+    if (r.project) this.bases.set(id, r.project.updatedAt);
+    return r.project;
+  }
+  async saveProject(p, summary) {
+    const r = await this.call('saveProject', { project: p, summary, base: this.bases.get(p.id) || null });
+    if (r.conflict) {
+      this.bases.set(p.id, r.project.updatedAt);
+      throw new StorageError('他の利用者が先に更新しました', { conflict: true });
+    }
+    this.bases.set(p.id, p.updatedAt);
+    this.lastIndex = { projects: r.index || [] };
+  }
+  async deleteProject(p) {
+    const r = await this.call('deleteProject', { id: p.id });
+    this.bases.delete(p.id);
+    this.lastIndex = { projects: r.index || [] };
+  }
+  async uploadFile(projectId, file) {
+    const base64 = await b64FromBlob(file);
+    const r = await this.call('uploadFile', { projectId, name: file.name, type: file.type, base64 });
+    return { id: r.id, name: file.name, size: file.size, type: file.type, uploadedAt: new Date().toISOString() };
+  }
+  async downloadFile(meta) {
+    const r = await this.call('downloadFile', { id: meta.id });
+    return blobFromB64(r.base64, r.type || meta.type);
+  }
+  async deleteFile(meta) { await this.call('deleteFile', { id: meta.id }); }
 }
