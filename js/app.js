@@ -78,7 +78,7 @@ async function init() {
   window.addEventListener('hashchange', route);
   window.addEventListener('focus', () => { if (Date.now() - state.lastRefresh > 15000) refresh(false); });
   window.addEventListener('beforeunload', e => {
-    if (state.dirty.size || state.saveTimer || state.saving) { e.preventDefault(); e.returnValue = ''; }
+    if (state.dirty.size || state.saveTimer || state.saving || state.settingsSaveTimer || state.settingsSaving) { e.preventDefault(); e.returnValue = ''; }
   });
   $('#btn-refresh').addEventListener('click', () => refresh(true));
   app.innerHTML = '<p class="help">読み込み中…</p>';
@@ -113,6 +113,7 @@ function updateConnBadge() {
 /* ===== ルーティング ===== */
 async function route() {
   if (state.saveTimer) { clearTimeout(state.saveTimer); state.saveTimer = null; await saveNow(); }
+  if (state.settingsSaveTimer) { clearTimeout(state.settingsSaveTimer); state.settingsSaveTimer = null; await saveSettingsNow(); }
   const h = location.hash || '#/';
   let m;
   if (h === '#/settings') { state.project = null; return renderSettings(); }
@@ -544,7 +545,7 @@ function onSubmit(e) {
   if (form.id === 'conn-form') return saveConnection(form);
   if (form.id === 'budget-add') {
     const b = form.b.value.trim();
-    if (b && !state.draft.budgets.includes(b)) { state.draft.budgets.push(b); renderSettings(); }
+    if (b && !state.draft.budgets.includes(b)) { state.draft.budgets.push(b); rerenderSettings(); }
     return;
   }
 }
@@ -753,9 +754,50 @@ function settingsDataHTML() {
       ${CATEGORIES.map(c => templateHTML(c, d.templates[c.id])).join('')}
     </section>
     <div class="actions sticky">
-      <button type="button" id="btn-save-settings" class="btn primary">予算・テンプレートを保存</button>
+      <span class="help" id="settings-status">${esc(state.settingsStatus || '変更は自動的に保存されます')}</span>
       <button type="button" id="btn-reset-templates" class="btn ghost small">テンプレートを初期値に戻す</button>
     </div>`;
+}
+
+function setSettingsStatus(text, isError) {
+  state.settingsStatus = text;
+  const el = $('#settings-status');
+  if (el) { el.textContent = text; el.className = 'help' + (isError ? ' error' : ''); }
+}
+
+function cleanedSettings(d) {
+  return normalizeSettings({
+    budgets: d.budgets.map(b => b.trim()).filter(Boolean),
+    templates: Object.fromEntries(Object.entries(d.templates).map(([k, secs]) => [k, secs.map(s => ({
+      name: s.name.trim() || '項目',
+      items: s.items.filter(i => i.label.trim()).map(i => ({ label: i.label.trim(), type: i.type })),
+    }))])),
+  });
+}
+
+function scheduleSettingsSave() {
+  setSettingsStatus('未保存の変更があります');
+  clearTimeout(state.settingsSaveTimer);
+  state.settingsSaveTimer = setTimeout(() => { state.settingsSaveTimer = null; saveSettingsNow(); }, 800);
+}
+
+async function saveSettingsNow() {
+  if (!state.draft || !state.store) return;
+  if (state.settingsSaving) { state.settingsPending = true; return; }
+  state.settingsSaving = true;
+  const cleaned = cleanedSettings(state.draft);
+  setSettingsStatus('保存中…');
+  try {
+    await state.store.saveSettings(cleaned);
+    state.settings = cleaned;
+    setSettingsStatus('保存済み ' + new Date().toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' }));
+  } catch (err) {
+    setSettingsStatus('保存エラー: ' + err.message, true);
+    toast('設定の保存に失敗しました: ' + err.message, 'error');
+  } finally {
+    state.settingsSaving = false;
+    if (state.settingsPending) { state.settingsPending = false; saveSettingsNow(); }
+  }
 }
 
 function templateHTML(c, secs) {
@@ -807,19 +849,20 @@ function settingsFieldChange(t) {
   const d = state.draft;
   if (t.closest('#conn-form')) return;
   if (!d) return;
-  if (t.dataset.budget !== undefined) { d.budgets[+t.dataset.budget] = t.value; return; }
+  if (t.dataset.budget !== undefined) { d.budgets[+t.dataset.budget] = t.value; scheduleSettingsSave(); return; }
   const tpl = t.closest('.tpl');
   if (!tpl) return;
   const secs = d.templates[tpl.dataset.cat];
   const secEl = t.closest('.tpl-sec');
   if (!secEl) return;
   const sec = secs[+secEl.dataset.si];
-  if (t.hasAttribute('data-secname')) { sec.name = t.value; return; }
+  if (t.hasAttribute('data-secname')) { sec.name = t.value; scheduleSettingsSave(); return; }
   const li = t.closest('li');
   if (!li) return;
   const it = sec.items[+li.dataset.ii];
   if (t.hasAttribute('data-tlabel')) it.label = t.value;
   if (t.hasAttribute('data-ttype')) it.type = t.value;
+  scheduleSettingsSave();
 }
 
 async function settingsClick(e) {
@@ -844,29 +887,8 @@ async function settingsClick(e) {
   if (!d) return;
   const act = btn.dataset.act;
 
-  if (btn.id === 'btn-save-settings') {
-    const cleaned = normalizeSettings({
-      budgets: d.budgets.map(b => b.trim()).filter(Boolean),
-      templates: Object.fromEntries(Object.entries(d.templates).map(([k, secs]) => [k, secs.map(s => ({
-        name: s.name.trim() || '項目',
-        items: s.items.filter(i => i.label.trim()).map(i => ({ label: i.label.trim(), type: i.type })),
-      }))])),
-    });
-    btn.disabled = true;
-    try {
-      await state.store.saveSettings(cleaned);
-      state.settings = cleaned;
-      state.draft = clone(cleaned);
-      toast('設定を保存しました');
-      state.connDraft = readConnForm();
-      renderSettings();
-    } catch (err) {
-      toast('保存に失敗しました: ' + err.message, 'error');
-    } finally { btn.disabled = false; }
-    return;
-  }
   if (btn.id === 'btn-reset-templates') {
-    if (!confirm('すべてのカテゴリのテンプレートを初期値に戻しますか？（保存ボタンを押すまで確定しません）')) return;
+    if (!confirm('すべてのカテゴリのテンプレートを初期値に戻しますか？')) return;
     d.templates = clone(DEFAULT_TEMPLATES);
     rerenderSettings();
     return;
@@ -900,6 +922,7 @@ async function settingsClick(e) {
 function rerenderSettings() {
   state.connDraft = readConnForm();
   renderSettings();
+  scheduleSettingsSave();
 }
 
 async function saveConnection(form) {
